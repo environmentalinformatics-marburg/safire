@@ -1,39 +1,41 @@
 ### environmental stuff -----
 
+## clear workspace 
+rm(list = ls(all = TRUE))
+
 ## required packages
 # devtools::install_github("MatMatt/MODIS", ref = "develop")
 lib <- c("MODIS", "doParallel", "rworldmap")
 jnk <- sapply(lib, function(x) library(x, character.only = TRUE))
 
 ## working directory
-setwd("/media/fdetsch/XChange")
+setwd("/media/dogbert/modis_data")
 
 ## parallelization
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
 
 ## modis options
-MODISoptions(localArcPath = "/media/fdetsch/XChange/MODIS_ARC/", 
-             outDirPath = "/media/fdetsch/XChange/MODIS_ARC/PROCESSED/")
+MODISoptions(localArcPath = "MODIS_ARC/", outDirPath = "MODIS_ARC/PROCESSED/")
 
 
 ### data download -----
 
-## reference extent
-ext <- subset(countriesCoarse, ADMIN.1 == "South Africa")
+# ## reference extent
+# ext <- subset(countriesCoarse, ADMIN.1 == "South Africa")
+# 
+# ## download data in parallel
+# foreach(product = c("MOD14A1", "MYD14A1"), .packages = "MODIS") %dopar%
+#   runGdal(product, extent = ext, job = paste0(product, ".006"),
+#           collection = getCollection(product, forceCheck = TRUE))
 
-## download data in parallel
-foreach(product = c("MOD14A1", "MYD14A1"), .packages = "MODIS") %dopar%
-  runGdal(product, extent = ext, job = paste0(product, ".006"),
-          collection = getCollection(product, forceCheck = TRUE))
 
-
-### quality control -----
+### data processing -----
 
 ## loop over products
 lst_prd <- lapply(c("MOD14A1.006", "MYD14A1.006"), function(product) {
   
-  dir_prd <- paste0("data/", product)
+  dir_prd <- paste0("/media/dogbert/dev/data/", product)
   if (!dir.exists(dir_prd)) dir.create(dir_prd)
   
   ## crop images
@@ -81,14 +83,13 @@ lst_prd <- lapply(c("MOD14A1.006", "MYD14A1.006"), function(product) {
     return(rst)
   }
 
-  
-  ## target folder and files
+  ## reclassify images
   dir_rcl <- paste0(dir_prd, "/rcl")
   if (!dir.exists(dir_rcl)) dir.create(dir_rcl)
   
   fls_rcl <- paste0(dir_rcl, "/", names(rst[[1]]), ".tif")
   
-  ## reclassification matrix
+  # reclassification matrix
   rcl <- matrix(c(0, 7, 0, 
                   7, 10, 1, 
                   10, 255, 0), ncol = 3, byrow = TRUE)
@@ -107,15 +108,14 @@ lst_prd <- lapply(c("MOD14A1.006", "MYD14A1.006"), function(product) {
   rst_rcl <- stack(lst_rcl); rm(lst_rcl)
   
   
-  ### quality control, step #1: -----
-  ### discard clouds, snow/ice and filled pixels using 'pixel_reliability'
-  
-  ## indices
+  ## create annual frequency images
+
+  # indices
   dts <- extractDate(names(rst[[1]]))$inputLayerDates
   yrs <- substr(dts, 1, 4)
   ids <- as.numeric(as.factor(yrs))
   
-  ## target folder and files
+  # target folder and files
   dir_yrs <- paste0(dir_prd, "/yrs")
   if (!dir.exists(dir_yrs)) dir.create(dir_yrs)
   
@@ -124,29 +124,19 @@ lst_prd <- lapply(c("MOD14A1.006", "MYD14A1.006"), function(product) {
   })
   fls_yrs <- paste0(dir_yrs, "/", fls_yrs, ".tif")
   
-  foreach(j = unique(ids), k = fls_yrs, .packages = lib, 
-          .export = ls(envir = globalenv())) %dopar% {
-    if (file.exists(k)) {
-      raster(k)
-    } else {
-      rst_yr <- rst[[1]][[which(ids == j)]]
-      calc(rst_yr, fun = sum, na.rm = TRUE, filename = k, 
-           format = "GeoTiff", overwrite = TRUE)
+  for (j in seq(unique(ids))) {
+    if (!file.exists(fls_yrs[j])) {
+      rst_yr <- rst_rcl[[which(ids == unique(ids)[j])]]
+      calc(rst_yr, fun = function(x) {
+        sum(x, na.rm = TRUE) / length(x)
+      }, filename = fls_yrs[j], format = "GTiff", overwrite = TRUE)
+      rm(rst_yr)
     }
   }
   
-  ## perform quality check #1
-  lst_qc1 <- foreach(i = 1:nlayers(rst_crp[[1]]), .packages = lib, 
-                     .export = ls(envir = globalenv())) %dopar% {
-                       if (file.exists(fls_qc1[i])) {
-                         raster(fls_qc1[i])
-                       } else {
-                         overlay(rst_crp[[1]][[i]], rst_crp[[2]][[i]], fun = function(x, y) {
-                           x[!y[] %in% c(0, 1)] <- NA
-                           return(x)
-                         }, filename = fls_qc1[i], overwrite = TRUE, format = "GTiff")
-                       }
-                     }
+  rst_frq <- stack(fls_yrs)
+  return(rst_frq)
+})
   
-  rst_qc1 <- stack(lst_qc1)
-  
+## deregister parallel backend
+stopCluster(cl)
