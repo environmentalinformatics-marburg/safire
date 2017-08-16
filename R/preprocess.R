@@ -9,13 +9,19 @@ lib <- c("MODIS", "doParallel", "rworldmap")
 jnk <- sapply(lib, function(x) library(x, character.only = TRUE))
 
 ## working directory
+repo = getwd()
 setwd("/media/fdetsch/modis_data")
 
 ## parallelization
 cl <- makeCluster(detectCores() - 1)
 registerDoParallel(cl)
 
-## modis options
+clusterExport(cl, "lib")
+jnk = clusterEvalQ(cl, Orcs::loadPkgs(lib))
+
+## options
+options(stringsAsFactors = FALSE)
+
 MODISoptions(localArcPath = "MODIS_ARC/", outDirPath = "MODIS_ARC/PROCESSED/", 
              outProj = "+init=epsg:4326")
 
@@ -25,10 +31,16 @@ MODISoptions(localArcPath = "MODIS_ARC/", outDirPath = "MODIS_ARC/PROCESSED/",
 ## reference extent
 ext <- subset(countriesCoarse, ADMIN.1 == "South Africa")
 
-## download data in parallel
-clc = getCollection("M*D14A1", forceCheck = TRUE)
-tfs = runGdal("M*D14A1", extent = ext, job = "MCD14A1.006",
-              collection = clc[[1]])
+## download data
+fun_tfs = function(file) {
+  clc = MODIS::getCollection("M*D14A1", forceCheck = TRUE)
+  tfs = MODIS::runGdal("M*D14A1", extent = ext, job = "MCD14A1.006",
+                       collection = clc[[1]])
+  saveRDS(tfs, file)
+}
+
+tfs = Orcs::ifMissing(file.path(repo, "inst/extdata/mcd14a1-tif.rds"), 
+                      fun0 = readRDS, fun1 = fun_tfs, arg1 = "file")
 
 
 ### data processing -----
@@ -133,5 +145,94 @@ lst_prd <- lapply(names(tfs), function(product) {
   return(rst_frq)
 })
   
+
+### combined product -----
+
+fun_hdf = function(file) {
+  clc = MODIS::getCollection("M*D14A1", forceCheck = TRUE)
+  fls = MODIS::getHdf("M*D14A1", extent = ext, collection = clc[[1]])
+  saveRDS(fls, file)
+  return(fls)
+}
+
+hdf = Orcs::ifMissing(file.path(repo, "inst/extdata/mcd14a1-hdf.rds"), 
+                      fun0 = readRDS, fun1 = fun_hdf, arg1 = "file")
+
+## loop over products
+mcd_dts <- lapply(names(hdf), function(product) {
+  
+  ## dates from hdf files
+  dpl = which(duplicated(dirname(hdf[[product]])))
+  fls = hdf[[product]][-dpl]
+  
+  dates = do.call(c, parSapply(cl, fls, function(i) {
+    nfo = suppressWarnings(rgdal::GDALinfo(i, returnScaleOffset = FALSE))
+    mtd = attr(nfo, "mdata")
+    dts = gsub("^Dates=", "", mtd[grep("^Dates=", mtd)])
+    Orcs::unlistStrsplit(dts, " ")
+  }))
+
+  ## reclassified images
+  rcl = list.files(paste0("/media/fdetsch/XChange/safire/", product, "/rcl"), 
+                   pattern = ".tif$", full.names = TRUE)
+  
+  dat = data.frame(date = as.Date(dates), rcl, row.names = NULL)
+  names(dat)[2] = product
+  
+  return(dat)
+})
+
+mcd_mrg = do.call(function(...) merge(..., by = "date", all = TRUE), mcd_dts)
+
+## remove duplicated dates at turns of the year
+dpl = which(duplicated(mcd_mrg$date))
+mcd_mrg = mcd_mrg[-dpl, ]
+
+mcd_fls = paste0("/media/fdetsch/XChange/safire/MCD14A1.006/MCD14A1.A", 
+                 format(mcd_mrg$date, "%Y%j.FireMask.tif"))
+
+clusterExport(cl, c("mcd_mrg", "mcd_fls"))
+mcd_rst = parLapply(cl, 1:nrow(mcd_mrg), function(i) {
+  if (is.na(mcd_mrg$MYD14A1.006[i])) {
+    raster(mcd_mrg$MOD14A1.006[i])
+  } else if (is.na(mcd_mrg$MOD14A1.006[i])) {
+    raster(mcd_mrg$MYD14A1.006[i])
+  } else {
+    
+    Orcs::ifMissing(mcd_fls[i], raster, function(filename) {
+      mod = raster(mcd_mrg$MOD14A1.006[i])
+      myd = raster(mcd_mrg$MYD14A1.006[i])
+      overlay(mod, myd, fun = function(x, y) {
+        x[y[] == 1] = 1L
+        return(x)
+      }, filename = mcd_fls[i], datatype = "INT1U")
+    }, arg1 = "filename")
+  }
+})
+mcd_rst = stack(mcd_rst)
+
+## combined annual frequency images
+dts <- extractDate(mcd_fls)$inputLayerDates
+yrs <- substr(dts, 1, 4)
+
+# target folder and files
+dir_yrs <- paste0("/media/fdetsch/XChange/safire/MCD14A1.006/yrs")
+if (!dir.exists(dir_yrs)) dir.create(dir_yrs)
+
+fls_yrs <- sapply(unique(yrs), function(j) {
+  gsub(dts[1], j, basename(mcd_fls[1]))
+})
+fls_yrs <- paste0(dir_yrs, "/", fls_yrs)
+
+for (j in seq(unique(yrs))) {
+  if (!file.exists(fls_yrs[j])) {
+    rst_yr <- mcd_rst[[which(yrs == unique(yrs)[j])]]
+    calc(rst_yr, fun = function(x) {
+      sum(x, na.rm = TRUE) / length(x)
+    }, filename = fls_yrs[j], format = "GTiff", overwrite = TRUE)
+    rm(rst_yr)
+  }
+}
+
 ## deregister parallel backend
 stopCluster(cl)
